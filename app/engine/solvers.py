@@ -9,9 +9,12 @@ that implements AssignmentEngineContract.
 """
 
 import abc
+import datetime
 import logging
 from typing import Any
 import uuid
+
+import pulp
 
 from app.contract import contract
 from app.domain import models
@@ -19,8 +22,9 @@ from app.domain import validation
 from app.engine import metrics
 from app.persistence import repositories
 
-import pulp
+
 logger = logging.getLogger(__name__)
+
 
 class AssignmentStrategy(abc.ABC):
     """Abstract Base Class for student-to-project allocation strategies.
@@ -66,11 +70,15 @@ class AssignmentStrategy(abc.ABC):
     ) -> tuple[str, list[models.Assignment], float | None, dict[str, Any]]:
         """Solves the assignment problem under this strategy's formulation.
 
-        In accordance with Section 8 of the specification, must:
-        - Assign students to projects respecting capacities [min_cap, max_cap].
-        - Enforce each student receives exactly one project allocation.
-        - Strictly preserve pre-allocated fixed assignments.
-        - Support integer no-good cuts (excluded_solutions) to guarantee distinct
+        Builds and solves a binary-assignment ILP whose objective weights come
+        from `calculate_cost_or_utility`. Shared across strategies so each
+        subclass only needs to define how a (student, project) pair is scored.
+
+        In accordance with Section 8 of the specification:
+        - Assigns students to projects respecting capacities [min_capacity, max_capacity].
+        - Enforces each student receives exactly one project allocation.
+        - Strictly preserves pre-allocated fixed assignments.
+        - Supports integer no-good cuts (excluded_solutions) to guarantee distinct
           Pareto alternatives.
 
         Args:
@@ -81,15 +89,198 @@ class AssignmentStrategy(abc.ABC):
 
         Returns:
             A tuple of (solver_status, assignments, objective_value, diagnostics).
-
-        Raises:
-            NotImplementedError: To be implemented by Team B.
         """
         fixed_assignments = fixed_assignments or []
         excluded_solutions = excluded_solutions or []
 
         max_preferences = max(
-            (len(getattr(s, 'preferences', {}) or {} for s in students)), default=0)
+            (len(s.preferences) for s in students),
+            default=0,
+        )
+
+        prob = pulp.LpProblem(f"assignment_{self.name}", pulp.LpMaximize)
+
+        # One binary decision variable per (student, project) pair.
+        x: dict[tuple[str, str], pulp.LpVariable] = {
+            (s.id, p.id): pulp.LpVariable(f"x_{s.id}_{p.id}", cat="Binary")
+            for s in students
+            for p in projects
+        }
+
+        # Objective: maximize total utility from calculate_cost_or_utility.
+        prob += pulp.lpSum(
+            self.calculate_cost_or_utility(s, p, max_preferences) * x[s.id, p.id]
+            for s in students
+            for p in projects
+        )
+
+        # Each student must be assigned to exactly one project.
+        for s in students:
+            prob += (
+                pulp.lpSum(x[s.id, p.id] for p in projects) == 1,
+                f"one_project_{s.id}",
+            )
+
+        # Each project must stay within [min_capacity, max_capacity].
+        for p in projects:
+            total = pulp.lpSum(x[s.id, p.id] for s in students)
+            prob += total >= p.min_capacity, f"min_cap_{p.id}"
+            prob += total <= p.max_capacity, f"max_cap_{p.id}"
+
+        # Pre-allocated assignments are locked in place.
+        for fa in fixed_assignments:
+            key = (fa.student_id, fa.project_id)
+            if key not in x:
+                raise ValueError(
+                    f"Fixed assignment references unknown student/project pair: {key}"
+                )
+            prob += x[key] == 1, f"fixed_{fa.student_id}"
+
+        # No-good cuts: forbid repeating any previously returned solution.
+        for i, solution in enumerate(excluded_solutions):
+            valid_pairs = [x[pair] for pair in solution if pair in x]
+            if valid_pairs:
+                prob += (
+                    pulp.lpSum(valid_pairs) <= len(valid_pairs) - 1,
+                    f"no_good_{i}",
+                )
+
+        solver_status_code = prob.solve(pulp.PULP_CBC_CMD(msg=False))
+        solver_status = pulp.LpStatus[solver_status_code]
+
+        fixed_pairs = {(fa.student_id, fa.project_id) for fa in fixed_assignments}
+
+        assignments: list[models.Assignment] = []
+        if solver_status == "Optimal":
+            for s in students:
+                for p in projects:
+                    var = x[s.id, p.id]
+                    if var.value() is not None and var.value() > 0.5:
+                        skill_fit_score, unmet = metrics.calculate_assignment_skill_fit(
+                            s, p
+                        )
+                        assignments.append(
+                            models.Assignment(
+                                student_id=s.id,
+                                project_id=p.id,
+                                is_fixed=(s.id, p.id) in fixed_pairs,
+                                preference_rank=s.get_preference_rank(p.id),
+                                skill_fit_score=skill_fit_score,
+                                unmet_requirements=unmet,
+                            )
+                        )
+                        break
+
+        objective_value = (
+            pulp.value(prob.objective) if solver_status == "Optimal" else None
+        )
+
+        diagnostics = {
+            "strategy": self.name,
+            "solver_status": solver_status,
+            "num_students": len(students),
+            "num_projects": len(projects),
+            "num_fixed": len(fixed_assignments),
+            "num_excluded_cuts": len(excluded_solutions),
+        }
+
+        return solver_status, assignments, objective_value, diagnostics
+
+
+class PreferenceOrientedSolver(AssignmentStrategy):
+    """Maximizes aggregate student preference satisfaction (Section 7.1)."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="PREFERENCE",
+            description=(
+                "Prioritizes assignments matching each student's "
+                "highest-ranked project."
+            ),
+        )
+
+    def calculate_cost_or_utility(
+        self,
+        student: models.Student,
+        project: models.Project,
+        max_preferences: int,
+    ) -> float:
+        rank = student.get_preference_rank(project.id)
+        if rank is None:
+            return 0.0
+        return float(max_preferences - rank + 1)
+
+
+class SkillFitOrientedSolver(AssignmentStrategy):
+    """Maximizes aggregate student-project technical skill fit (Section 7.2)."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            name="SKILL_FIT",
+            description=(
+                "Prioritizes assignments where students best satisfy "
+                "project skill requirements."
+            ),
+        )
+
+    def calculate_cost_or_utility(
+        self,
+        student: models.Student,
+        project: models.Project,
+        max_preferences: int,
+    ) -> float:
+        score, _unmet = metrics.calculate_assignment_skill_fit(student, project)
+        # Scale to a comparable magnitude with preference-rank utilities.
+        return score * max(max_preferences, 1)
+
+
+class BalancedTradeoffSolver(AssignmentStrategy):
+    """Blends preference satisfaction and skill fit into one objective."""
+
+    def __init__(self, preference_weight: float = 0.5) -> None:
+        super().__init__(
+            name="BALANCED",
+            description=(
+                "Balances preference satisfaction against technical skill fit."
+            ),
+        )
+        self.preference_weight = preference_weight
+
+    def calculate_cost_or_utility(
+        self,
+        student: models.Student,
+        project: models.Project,
+        max_preferences: int,
+    ) -> float:
+        rank = student.get_preference_rank(project.id)
+        pref_component = (
+            0.0
+            if rank is None
+            else (max_preferences - rank + 1) / max(max_preferences, 1)
+        )
+        skill_component, _unmet = metrics.calculate_assignment_skill_fit(
+            student, project
+        )
+        return (
+            self.preference_weight * pref_component
+            + (1.0 - self.preference_weight) * skill_component
+        )
+
+
+# Strategies are resolved lazily by key rather than stored on the engine
+# instance, so AssignmentEngine.strategies can stay empty at construction
+# (test_solvers.py::test_assignment_engine_initialization depends on this).
+_STRATEGY_REGISTRY: dict[str, type[AssignmentStrategy]] = {
+    "PREFERENCE": PreferenceOrientedSolver,
+    "SKILL_FIT": SkillFitOrientedSolver,
+    "BALANCED": BalancedTradeoffSolver,
+}
+
+
+def _resolve_strategy(strategy_key: str) -> AssignmentStrategy:
+    """Instantiates the strategy for a given key, defaulting to PREFERENCE."""
+    strategy_cls = _STRATEGY_REGISTRY.get(strategy_key, PreferenceOrientedSolver)
+    return strategy_cls()
 
 
 class AssignmentEngine(contract.AssignmentEngineContract):
@@ -110,9 +301,9 @@ class AssignmentEngine(contract.AssignmentEngineContract):
         self.run_repo = (
             run_repo if run_repo is not None else repositories.RunRepository()
         )
-        self.strategies: dict[str, AssignmentStrategy] = {
-            # Team B: Instantiate and register your custom strategies here
-        }
+        # Intentionally left empty: strategies are resolved on demand by
+        # _resolve_strategy() in execute_run, not stored here.
+        self.strategies: dict[str, AssignmentStrategy] = {}
 
     def validate_inputs(
         self, request: contract.RunRequest
@@ -144,26 +335,125 @@ class AssignmentEngine(contract.AssignmentEngineContract):
     ) -> models.AssignmentRun:
         """Executes the assignment algorithm, calculates metrics, and persists run.
 
-        In accordance with Section 8 of the specification, Team B must:
-        1. Synchronize entities to maintain relational integrity.
-        2. Validate cohort feasibility.
-        3. Run assignment solver(s) to generate one or more distinct alternatives.
-        4. Calculate indicators for each alternative using app.engine.metrics.
-        5. Persist run and solutions via self.run_repo.
-        6. Return populated models.AssignmentRun.
+        In accordance with Section 8 of the specification:
+        1. Validates cohort feasibility.
+        2. Synchronizes entities to maintain relational integrity.
+        3. Runs the assignment solver to generate distinct alternatives,
+           applying no-good cuts until max_alternatives is reached or no
+           further distinct feasible solution exists.
+        4. Calculates indicators for each alternative using app.engine.metrics.
+        5. Persists run and solutions via self.run_repo.
+        6. Returns the populated models.AssignmentRun.
 
         Args:
             request: The run request containing students, projects, etc.
 
         Returns:
             The created AssignmentRun populated with alternative solutions.
-
-        Raises:
-            NotImplementedError: To be implemented by Team B.
         """
-        raise NotImplementedError(
-            "TODO (Team B): Implement execute_run in app/engine/solvers.py"
+        run_id = str(uuid.uuid4())
+        created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        base_configuration = {
+            "max_alternatives": request.max_alternatives,
+            "primary_strategy": request.strategy_key,
+            "engine": "AssignmentEngine",
+        }
+
+        val_outcome = self.validate_inputs(request)
+        if not val_outcome.is_feasible:
+            run = models.AssignmentRun(
+                id=run_id,
+                created_at=created_at,
+                status=contract.RunStatus.INFEASIBLE.value,
+                configuration=base_configuration,
+                solutions=[],
+                diagnostics={
+                    "solver_status": "INFEASIBLE",
+                    "reasons": val_outcome.infeasibility_reasons,
+                    "distinct_alternatives": 0,
+                },
+            )
+            self.run_repo.save_run(run)
+            return run
+
+        # Synchronize entities to maintain relational integrity.
+        if request.skills:
+            skill_repo = repositories.SkillRepository()
+            for sk in request.skills:
+                skill_repo.save(sk)
+
+        proj_repo = repositories.ProjectRepository()
+        for proj in request.projects:
+            proj_repo.save(proj)
+
+        stud_repo = repositories.StudentRepository()
+        for stud in request.students:
+            stud_repo.save(stud)
+
+        if request.fixed_assignments:
+            fixed_repo = repositories.FixedAssignmentRepository()
+            for fa in request.fixed_assignments:
+                fixed_repo.save(fa)
+
+        strategy = _resolve_strategy(request.strategy_key)
+
+        solutions: list[models.Solution] = []
+        excluded_solutions: list[list[tuple[str, str]]] = []
+        last_status = "NOT_SOLVED"
+
+        for alt_idx in range(max(1, request.max_alternatives)):
+            status, assignments, objective_value, solve_diag = strategy.solve(
+                students=request.students,
+                projects=request.projects,
+                fixed_assignments=request.fixed_assignments,
+                excluded_solutions=excluded_solutions,
+            )
+            last_status = status
+            if status != "Optimal" or not assignments:
+                break
+
+            indicators = metrics.compute_solution_indicators(
+                students=request.students,
+                projects=request.projects,
+                assignments=assignments,
+                fixed_assignments=request.fixed_assignments,
+            )
+
+            solution = models.Solution(
+                id=str(uuid.uuid4()),
+                run_id=run_id,
+                alternative_number=alt_idx + 1,
+                strategy_name=strategy.name,
+                objective_value=objective_value,
+                assignments=assignments,
+                indicators=indicators,
+                warnings=[],
+                diagnostics=solve_diag,
+            )
+            solutions.append(solution)
+            excluded_solutions.append(
+                [(a.student_id, a.project_id) for a in assignments]
+            )
+
+        status_value = (
+            contract.RunStatus.COMPLETED.value
+            if solutions
+            else contract.RunStatus.INFEASIBLE.value
         )
+
+        run = models.AssignmentRun(
+            id=run_id,
+            created_at=created_at,
+            status=status_value,
+            configuration=base_configuration,
+            solutions=solutions,
+            diagnostics={
+                "solver_status": last_status,
+                "distinct_alternatives": len(solutions),
+            },
+        )
+        self.run_repo.save_run(run)
+        return run
 
     def run_assignment(
         self,
