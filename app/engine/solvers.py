@@ -19,6 +19,8 @@ from app.domain import validation
 from app.engine import metrics
 from app.persistence import repositories
 
+import pulp
+logger = logging.getLogger(__name__)
 
 class AssignmentStrategy(abc.ABC):
     """Abstract Base Class for student-to-project allocation strategies.
@@ -83,9 +85,11 @@ class AssignmentStrategy(abc.ABC):
         Raises:
             NotImplementedError: To be implemented by Team B.
         """
-        raise NotImplementedError(
-            f"TODO (Team B): Implement solver logic for strategy '{self.name}'"
-        )
+        fixed_assignments = fixed_assignments or []
+        excluded_solutions = excluded_solutions or []
+
+        max_preferences = max(
+            (len(getattr(s, 'preferences', {}) or {} for s in students)), default=0)
 
 
 class AssignmentEngine(contract.AssignmentEngineContract):
