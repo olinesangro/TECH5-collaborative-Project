@@ -68,13 +68,14 @@
             </thead>
             <tbody>
               {% for sk in skills %}
+                {% set req = (project.requirements | selectattr('skill_id', 'equalto', sk.id) | first) if project else none %}
                 <tr>
                   <td><strong>{{ sk.name }}</strong> (<code>{{ sk.id }}</code>)</td>
                   <td style="width: 150px;">
-                    <input type="number" name="req_level_{{ sk.id }}" min="0" max="5" class="form-control" value="0">
+                    <input type="number" name="req_level_{{ sk.id }}" min="0" max="5" class="form-control" value="{{ req.minimum_level if req else 0 }}">
                   </td>
                   <td style="text-align: center; width: 150px;">
-                    <input type="checkbox" name="req_mand_{{ sk.id }}" value="1">
+                    <input type="checkbox" name="req_mand_{{ sk.id }}" value="1" {% if req and req.is_mandatory %}checked{% endif %}>
                   </td>
                 </tr>
               {% endfor %}

@@ -231,6 +231,10 @@ def test_projects_crud_workflow(tmp_path: pathlib.Path) -> None:
     assert project.requirements[0].minimum_level == 3
     assert project.requirements[0].is_mandatory
 
+    # The edit form shows the saved requirement, not a blank form.
+    res = client.get("/projects/P1/edit")
+    assert b'value="3"' in res.data
+
     response = client.post(
         "/projects/P1/edit",
         data={
