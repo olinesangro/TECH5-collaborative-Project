@@ -904,18 +904,106 @@ def clear_solutions() -> flask.Response:
 # Comparison & Recommendations
 # -----------------------------------------------------------------------------
 
+def _run_comparison(
+    sol_a_id: str, sol_b_id: str
+) -> models.RunComparison:
+    """Compares two solutions through the engine contract.
+
+    Uses Team B's AssignmentEngine and falls back to the mock engine while
+    the real comparison metrics are not implemented yet.
+
+    Args:
+        sol_a_id: Identifier of the baseline solution A.
+        sol_b_id: Identifier of the comparison solution B.
+
+    Returns:
+        The RunComparison produced by the engine.
+
+    Raises:
+        KeyError: If either solution cannot be found.
+    """
+    engine: contract.AssignmentEngineContract = solvers.AssignmentEngine()
+    try:
+        return engine.compare_solutions(sol_a_id, sol_b_id)
+    except NotImplementedError:
+        mock_engine = mocks.MockAssignmentEngine()
+        return mock_engine.compare_solutions(sol_a_id, sol_b_id)
+
+
+def _add_display_names(comparison: models.RunComparison) -> None:
+    """Replaces raw identifiers with student names and project titles.
+
+    Args:
+        comparison: Comparison whose changed assignments are updated.
+    """
+    names = {
+        s.id: s.display_name
+        for s in repositories.StudentRepository().list_all()
+    }
+    titles = {
+        p.id: p.title for p in repositories.ProjectRepository().list_all()
+    }
+    for change in comparison.changed_assignments:
+        s_id = change.get("student_id", "")
+        p_a = change.get("project_a_id", "")
+        p_b = change.get("project_b_id", "")
+        change["student_name"] = names.get(s_id, s_id)
+        change["project_a_title"] = titles.get(p_a, p_a)
+        change["project_b_title"] = titles.get(p_b, p_b)
+
 
 @web_bp.get("/compare")
 def compare_solutions() -> Any:
     """Renders side-by-side comparative analysis of two solutions.
 
-    Raises:
-        NotImplementedError: To be implemented by Team A.
-    """
-    raise NotImplementedError(
-        "TODO (Team A): Implement side-by-side solution comparison controller"
-    )
+    Reads the solution identifiers from the sol1 and sol2 query
+    parameters. When only sol1 is given, another alternative from the same
+    run is chosen as solution B.
 
+    Returns:
+        The rendered comparison page.
+    """
+    repo = repositories.RunRepository()
+    all_solutions = [
+        sol for run in repo.list_runs(limit=10) for sol in run.solutions
+    ]
+
+    sol_a_id = flask.request.args.get("sol1", "").strip()
+    sol_b_id = flask.request.args.get("sol2", "").strip()
+
+    sol_a = repo.get_solution(sol_a_id) if sol_a_id else None
+    if sol_a is not None and not sol_b_id:
+        run = repo.get_run(sol_a.run_id)
+        others = [s for s in run.solutions if s.id != sol_a.id] if run else []
+        if others:
+            sol_b_id = others[0].id
+    sol_b = repo.get_solution(sol_b_id) if sol_b_id else None
+
+    comparison = None
+    if sol_a_id and sol_b_id:
+        if sol_a is None or sol_b is None:
+            flask.flash(
+                "One or both selected solutions were not found.", "danger"
+            )
+        elif sol_a.id == sol_b.id:
+            flask.flash(
+                "Select two different solutions to compare.", "warning"
+            )
+        else:
+            try:
+                comparison = _run_comparison(sol_a.id, sol_b.id)
+            except KeyError as exc:
+                flask.flash(f"Comparison failed: {exc}", "danger")
+            else:
+                _add_display_names(comparison)
+
+    return flask.render_template(
+        "compare.html",
+        all_solutions=all_solutions,
+        sol_a=sol_a,
+        sol_b=sol_b,
+        comparison=comparison,
+    )
 
 @web_bp.get("/recommendations/<run_id>")
 def view_recommendations(run_id: str) -> Any:
