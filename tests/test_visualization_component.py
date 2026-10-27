@@ -172,17 +172,13 @@ def test_create_student_preference_validation(
     assert saved.preferences[0].project_id == "P1"
 
 
-@pytest.mark.xfail(
-    raises=NotImplementedError,
-    reason="TODO (Team A): Implement skill CRUD",
-)
 def test_skills_crud_workflow(tmp_path: pathlib.Path) -> None:
-    """Verifies skill addition workflow (Team A implementation)."""
+    """Verifies skill creation and deletion (Team A implementation)."""
     db_file = tmp_path / "test_skill.db"
     app = create_app({"TESTING": True, "DATABASE_PATH": db_file})
     client = app.test_client()
 
-    client.post(
+    response = client.post(
         "/skills/new",
         data={
             "id": "py",
@@ -191,19 +187,27 @@ def test_skills_crud_workflow(tmp_path: pathlib.Path) -> None:
         },
         follow_redirects=True,
     )
+    assert response.status_code == 200
+    assert b"Python" in response.data
+
+    response = client.post("/skills/py/delete", follow_redirects=True)
+    assert response.status_code == 200
+    assert b"Python Programming" not in response.data
 
 
-@pytest.mark.xfail(
-    raises=NotImplementedError,
-    reason="TODO (Team A): Implement project CRUD",
-)
 def test_projects_crud_workflow(tmp_path: pathlib.Path) -> None:
-    """Verifies project addition workflow (Team A implementation)."""
+    """Verifies project create, edit and delete (Team A implementation)."""
     db_file = tmp_path / "test_proj.db"
     app = create_app({"TESTING": True, "DATABASE_PATH": db_file})
     client = app.test_client()
 
     client.post(
+        "/skills/new",
+        data={"id": "py", "name": "Python", "description": ""},
+        follow_redirects=True,
+    )
+
+    response = client.post(
         "/projects/new",
         data={
             "id": "P1",
@@ -211,19 +215,92 @@ def test_projects_crud_workflow(tmp_path: pathlib.Path) -> None:
             "description": "Risk analytics",
             "min_capacity": 1,
             "max_capacity": 2,
+            "req_level_py": 3,
+            "req_mand_py": "1",
         },
         follow_redirects=True,
     )
+    assert response.status_code == 200
+    assert b"FinTech Risk" in response.data
+
+    with app.app_context():
+        project = repositories.ProjectRepository().get_by_id("P1")
+    assert project is not None
+    assert project.max_capacity == 2
+    assert len(project.requirements) == 1
+    assert project.requirements[0].minimum_level == 3
+    assert project.requirements[0].is_mandatory
+
+    # The edit form shows the saved requirement, not a blank form.
+    res = client.get("/projects/P1/edit")
+    assert b'value="3"' in res.data
+
+    response = client.post(
+        "/projects/P1/edit",
+        data={
+            "title": "FinTech Risk v2",
+            "min_capacity": 0,
+            "max_capacity": 3,
+            "req_level_py": 0,
+        },
+        follow_redirects=True,
+    )
+    assert b"FinTech Risk v2" in response.data
+    with app.app_context():
+        project = repositories.ProjectRepository().get_by_id("P1")
+    assert project.max_capacity == 3
+    assert project.requirements == []
+
+    response = client.post(
+        "/projects/new",
+        data={
+            "id": "P2",
+            "title": "Bad capacity",
+            "min_capacity": 5,
+            "max_capacity": 2,
+        },
+        follow_redirects=True,
+    )
+    assert b"cannot exceed" in response.data
+
+    response = client.post("/projects/P1/delete", follow_redirects=True)
+    assert response.status_code == 200
+    with app.app_context():
+        assert repositories.ProjectRepository().get_by_id("P1") is None
 
 
-@pytest.mark.xfail(
-    raises=NotImplementedError,
-    reason="TODO (Team A): Implement comparison controller & view",
-)
 def test_compare_solutions_view(tmp_path: pathlib.Path) -> None:
-    """Verifies solution comparison controller (Team A implementation)."""
+    """Verifies the side-by-side comparison page (Team A implementation)."""
     db_file = tmp_path / "test_comp.db"
     app = create_app({"TESTING": True, "DATABASE_PATH": db_file})
     client = app.test_client()
 
-    client.get("/compare?sol1=S1&sol2=S2")
+    # Unknown solutions must show a message instead of crashing.
+    res = client.get("/compare?sol1=S1&sol2=S2")
+    assert res.status_code == 200
+    assert b"not found" in res.data
+
+    client.post("/load-scenario/standard", follow_redirects=True)
+    client.post(
+        "/runs/trigger",
+        data={"primary_strategy": "PREFERENCE", "max_alternatives": 3},
+        follow_redirects=True,
+    )
+    run = repositories.RunRepository().list_runs(limit=1)[0]
+    assert len(run.solutions) >= 2
+    sol_a, sol_b = run.solutions[0], run.solutions[1]
+
+    res = client.get(f"/compare?sol1={sol_a.id}&sol2={sol_b.id}")
+    assert res.status_code == 200
+    assert b"Detailed Allocation Shifts" in res.data
+    assert b"Rank Gini" in res.data
+
+    # Only sol1 given: another alternative from the same run is picked.
+    res = client.get(f"/compare?sol1={sol_a.id}")
+    assert res.status_code == 200
+    assert b"Detailed Allocation Shifts" in res.data
+
+    # Comparing a solution with itself is rejected with a warning.
+    res = client.get(f"/compare?sol1={sol_a.id}&sol2={sol_a.id}")
+    assert res.status_code == 200
+    assert b"two different solutions" in res.data

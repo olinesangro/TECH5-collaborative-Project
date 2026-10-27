@@ -43,13 +43,7 @@
       </button>
     </form>
 
-    <!-- TODO (Team A): Implement Side-by-Side Solution Comparison -->
-    <div class="alert alert-info" style="margin-bottom: 1.5rem;">
-      <strong>Team A Starter Carcass:</strong>
-      Implement the comparative analysis view below using the <code>RunComparison</code> DTO.
-      Display comparative delta metrics (skill fit, preference rank, Gini), trade-off findings,
-      and the table of changed student allocations between Solution A and Solution B.
-    </div>
+
 
     {% if comparison and sol_a and sol_b %}
       <!-- Comparative KPI Deltas -->
@@ -82,6 +76,14 @@
           <span class="kpi-sub">Lower rank number is better</span>
         </div>
 
+        {% set gini_delta = comparison.delta_metrics.get('gini_delta', 0) %}
+        <div class="kpi-card">
+          <span class="kpi-label">&Delta; Rank Gini (Fairness)</span>
+          <span class="kpi-value {% if gini_delta < 0 %}text-success{% elif gini_delta > 0 %}text-danger{% endif %}">
+            {% if gini_delta > 0 %}+{% endif %}{{ gini_delta }}
+          </span>
+          <span class="kpi-sub">Lower means outcomes are spread more equally</span>
+        </div>
         <div class="kpi-card">
           <span class="kpi-label">Rank Shifts in Cohort</span>
           <span class="kpi-value">
