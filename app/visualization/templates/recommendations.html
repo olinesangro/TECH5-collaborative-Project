@@ -46,6 +46,17 @@
                 {% endfor %}
               </ul>
 
+              {% if rec.notes %}
+                <div class="alert alert-info" style="margin-top: 0.75rem; font-size: 0.85rem;">
+                  <strong>Decision notes:</strong>
+                  <ul style="margin-left: 1.25rem; margin-top: 0.25rem;">
+                    {% for note in rec.notes %}
+                      <li>{{ note }}</li>
+                    {% endfor %}
+                  </ul>
+                </div>
+              {% endif %}
+
               <div style="margin-top: 1rem; padding-top: 0.75rem; border-top: 1px dashed var(--border-color);">
                 <strong style="font-size: 0.82rem; color: var(--text-muted);">Criteria Evaluated:</strong>
                 <ul style="margin-left: 1.25rem; font-size: 0.82rem; color: var(--text-muted); margin-top: 0.25rem;">
@@ -68,7 +79,7 @@
               </div>
 
               <div style="margin-top: 1rem; background: var(--secondary-light); border-radius: var(--radius-sm); padding: 0.75rem; font-size: 0.82rem; color: var(--secondary);">
-                <strong>Governance Note:</strong> Final allocation decisions rest with the programme committee. If stakeholder priorities emphasize this focus, Solution {{ rec.recommended_alternative_number }} represents the mathematically optimal selection.
+                <strong>Governance Note:</strong> Final allocation decisions rest with the programme committee. If stakeholder priorities emphasize this focus, Solution {{ rec.recommended_alternative_number }} is the best of the generated alternatives on the criteria listed. Other feasible allocations may exist that were not generated.
               </div>
             </div>
           </div>
