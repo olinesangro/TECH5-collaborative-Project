@@ -172,17 +172,13 @@ def test_create_student_preference_validation(
     assert saved.preferences[0].project_id == "P1"
 
 
-@pytest.mark.xfail(
-    raises=NotImplementedError,
-    reason="TODO (Team A): Implement skill CRUD",
-)
 def test_skills_crud_workflow(tmp_path: pathlib.Path) -> None:
-    """Verifies skill addition workflow (Team A implementation)."""
+    """Verifies skill creation and deletion (Team A implementation)."""
     db_file = tmp_path / "test_skill.db"
     app = create_app({"TESTING": True, "DATABASE_PATH": db_file})
     client = app.test_client()
 
-    client.post(
+    response = client.post(
         "/skills/new",
         data={
             "id": "py",
@@ -191,6 +187,12 @@ def test_skills_crud_workflow(tmp_path: pathlib.Path) -> None:
         },
         follow_redirects=True,
     )
+    assert response.status_code == 200
+    assert b"Python" in response.data
+
+    response = client.post("/skills/py/delete", follow_redirects=True)
+    assert response.status_code == 200
+    assert b"Python Programming" not in response.data
 
 
 @pytest.mark.xfail(

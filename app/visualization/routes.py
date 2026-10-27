@@ -388,16 +388,94 @@ def new_project_form() -> str:
     )
 
 
+def _parse_project_form(
+    project_id: str,
+) -> tuple[models.Project | None, str]:
+    """Builds a Project from the submitted project form.
+
+    Args:
+        project_id: Identifier to give the project.
+
+    Returns:
+        A tuple of (project, error). The project is None when the form
+        is invalid, and error then explains why.
+    """
+    form = flask.request.form
+    title = form.get("title", "").strip()
+    description = form.get("description", "").strip()
+
+    if not project_id or not title:
+        return None, "Project ID and title are required."
+
+    try:
+        min_cap = int(form.get("min_capacity", "0") or 0)
+        max_cap = int(form.get("max_capacity", "1") or 1)
+    except ValueError:
+        return None, "Capacities must be whole numbers."
+
+    if min_cap < 0 or max_cap < 1:
+        return None, "Minimum must be 0 or more and maximum at least 1."
+    if min_cap > max_cap:
+        return None, "Minimum capacity cannot exceed maximum capacity."
+
+    requirements: list[models.ProjectRequirement] = []
+    for skill in repositories.SkillRepository().list_all():
+        try:
+            level = int(form.get(f"req_level_{skill.id}", "0") or 0)
+        except ValueError:
+            return None, f"Invalid level for skill '{skill.id}'."
+        if not 0 <= level <= 5:
+            return None, f"Level for skill '{skill.id}' must be 0 to 5."
+        if level > 0:
+            requirements.append(
+                models.ProjectRequirement(
+                    project_id=project_id,
+                    skill_id=skill.id,
+                    minimum_level=level,
+                    is_mandatory=form.get(f"req_mand_{skill.id}") == "1",
+                )
+            )
+
+    project = models.Project(
+        id=project_id,
+        title=title,
+        description=description,
+        min_capacity=min_cap,
+        max_capacity=max_cap,
+        requirements=requirements,
+    )
+    return project, ""
+
+
 @web_bp.post("/projects/new")
 def create_project() -> flask.Response:
-    """Processes creation of a project.
+    """Processes creation of a project and its skill requirements.
 
-    Raises:
-        NotImplementedError: To be implemented by Team A.
+    Returns:
+        A redirect to the project catalog, or back to the form on error.
     """
-    raise NotImplementedError(
-        "TODO (Team A): Implement project creation and requirement parsing"
-    )
+    if not auth.can_edit_cohort_data():
+        flask.flash("Permission denied for current role.", "danger")
+        return flask.redirect(flask.url_for("visualization_web.list_projects"))
+
+    project_id = flask.request.form.get("id", "").strip()
+    repo = repositories.ProjectRepository()
+    if repo.get_by_id(project_id) is not None:
+        flask.flash(f"Project '{project_id}' already exists.", "danger")
+        return flask.redirect(
+            flask.url_for("visualization_web.new_project_form")
+        )
+
+    project, error = _parse_project_form(project_id)
+    if project is None:
+        flask.flash(error, "warning")
+        return flask.redirect(
+            flask.url_for("visualization_web.new_project_form")
+        )
+
+    repo.save(project)
+    flask.flash(f"Project '{project.title}' created.", "info")
+    return flask.redirect(flask.url_for("visualization_web.list_projects"))
 
 
 @web_bp.get("/projects/<project_id>/edit")
@@ -416,27 +494,56 @@ def edit_project_form(project_id: str) -> Any:
 
 @web_bp.post("/projects/<project_id>/edit")
 def update_project(project_id: str) -> flask.Response:
-    """Updates an existing project entity.
+    """Updates an existing project and replaces its skill requirements.
 
-    Raises:
-        NotImplementedError: To be implemented by Team A.
+    Args:
+        project_id: Identifier of the project being edited.
+
+    Returns:
+        A redirect to the project catalog, or back to the form on error.
     """
-    raise NotImplementedError(
-        "TODO (Team A): Implement project update and requirement parsing"
-    )
+    if not auth.can_edit_cohort_data():
+        flask.flash("Permission denied for current role.", "danger")
+        return flask.redirect(flask.url_for("visualization_web.list_projects"))
+
+    repo = repositories.ProjectRepository()
+    if repo.get_by_id(project_id) is None:
+        flask.flash(f"Project '{project_id}' not found.", "danger")
+        return flask.redirect(flask.url_for("visualization_web.list_projects"))
+
+    project, error = _parse_project_form(project_id)
+    if project is None:
+        flask.flash(error, "warning")
+        return flask.redirect(
+            flask.url_for(
+                "visualization_web.edit_project_form", project_id=project_id
+            )
+        )
+
+    repo.save(project)
+    flask.flash(f"Project '{project.title}' updated.", "info")
+    return flask.redirect(flask.url_for("visualization_web.list_projects"))
 
 
 @web_bp.post("/projects/<project_id>/delete")
 def delete_project(project_id: str) -> flask.Response:
-    """Deletes a project.
+    """Deletes a project and, through the database, its requirements.
 
-    Raises:
-        NotImplementedError: To be implemented by Team A.
+    Args:
+        project_id: Identifier of the project to remove.
+
+    Returns:
+        A redirect to the project catalog page.
     """
-    raise NotImplementedError(
-        "TODO (Team A): Implement project deletion"
-    )
+    if not auth.can_edit_cohort_data():
+        flask.flash("Permission denied.", "danger")
+        return flask.redirect(flask.url_for("visualization_web.list_projects"))
 
+    if repositories.ProjectRepository().delete(project_id):
+        flask.flash(f"Project '{project_id}' removed.", "info")
+    else:
+        flask.flash(f"Project '{project_id}' not found.", "warning")
+    return flask.redirect(flask.url_for("visualization_web.list_projects"))
 
 # -----------------------------------------------------------------------------
 # Skills CRUD & Preferences Editor
@@ -452,26 +559,51 @@ def list_skills() -> str:
 
 @web_bp.post("/skills/new")
 def create_skill() -> flask.Response:
-    """Creates a new skill record.
+    """Creates a new skill record from the submitted form.
 
-    Raises:
-        NotImplementedError: To be implemented by Team A.
+    Returns:
+        A redirect to the skill catalog page.
     """
-    raise NotImplementedError(
-        "TODO (Team A): Implement skill creation"
-    )
+    if not auth.can_edit_cohort_data():
+        flask.flash("Permission denied for current role.", "danger")
+        return flask.redirect(flask.url_for("visualization_web.list_skills"))
 
+    skill_id = flask.request.form.get("id", "").strip().lower()
+    name = flask.request.form.get("name", "").strip()
+    description = flask.request.form.get("description", "").strip()
+
+    if not skill_id or not name:
+        flask.flash("Skill ID and name are required.", "warning")
+        return flask.redirect(flask.url_for("visualization_web.list_skills"))
+
+    repo = repositories.SkillRepository()
+    if repo.get_by_id(skill_id) is not None:
+        flask.flash(f"Skill '{skill_id}' already exists.", "danger")
+        return flask.redirect(flask.url_for("visualization_web.list_skills"))
+
+    repo.save(models.Skill(id=skill_id, name=name, description=description))
+    flask.flash(f"Skill '{name}' created.", "info")
+    return flask.redirect(flask.url_for("visualization_web.list_skills"))
 
 @web_bp.post("/skills/<skill_id>/delete")
 def delete_skill(skill_id: str) -> flask.Response:
     """Deletes a skill record.
 
-    Raises:
-        NotImplementedError: To be implemented by Team A.
+    Args:
+        skill_id: Identifier of the skill to remove.
+
+    Returns:
+        A redirect to the skill catalog page.
     """
-    raise NotImplementedError(
-        "TODO (Team A): Implement skill deletion"
-    )
+    if not auth.can_edit_cohort_data():
+        flask.flash("Permission denied.", "danger")
+        return flask.redirect(flask.url_for("visualization_web.list_skills"))
+
+    if repositories.SkillRepository().delete(skill_id):
+        flask.flash(f"Skill '{skill_id}' removed.", "info")
+    else:
+        flask.flash(f"Skill '{skill_id}' not found.", "warning")
+    return flask.redirect(flask.url_for("visualization_web.list_skills"))
 
 
 @web_bp.get("/preferences")
