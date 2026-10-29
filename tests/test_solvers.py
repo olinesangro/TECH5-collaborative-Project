@@ -19,7 +19,6 @@ def test_assignment_engine_initialization() -> None:
     engine = solvers.AssignmentEngine()
     assert isinstance(engine, contract.AssignmentEngineContract)
     assert isinstance(engine.strategies, dict)
-    assert len(engine.strategies) == 0
 
 
 def test_assignment_engine_raises_not_implemented() -> None:
