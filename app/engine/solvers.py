@@ -6,16 +6,26 @@ method (e.g. Integer Linear Programming, heuristic search, or stable matching).
 
 This module defines the abstract strategy base class and the AssignmentEngine
 that implements AssignmentEngineContract.
+
+Method: binary Integer Linear Program solved with PuLP (CBC, or HiGHS where
+the bundled CBC cannot run). Every strategy
+shares the same hard constraints (exact allocation, capacity bounds, fixed
+locks, mandatory-skill coverage, no-good cuts) and differs only in the
+objective weights returned by ``calculate_cost_or_utility``. Ties in the
+primary objective are broken lexicographically by ``secondary_utility``.
 """
 
 import abc
 import datetime
 import logging
+import os
+import time
 from typing import Any
 import uuid
 
 import pulp
 
+from app import config
 from app.contract import contract
 from app.domain import models
 from app.domain import validation
@@ -24,6 +34,98 @@ from app.persistence import repositories
 
 
 logger = logging.getLogger(__name__)
+
+
+# -----------------------------------------------------------------------------
+# Solver backend selection
+# -----------------------------------------------------------------------------
+# PuLP ships its own CBC executable, but the macOS copy is built for Intel
+# only, so it cannot start on Apple-silicon Macs without Rosetta ("Bad CPU
+# type in executable"). The engine therefore probes CBC once and falls back to
+# HiGHS (pip package ``highspy``, native on Apple silicon) only if CBC cannot
+# run. Set TECH5_SOLVER=CBC or TECH5_SOLVER=HIGHS to force a backend.
+
+_SOLVER_ENV_VAR = "TECH5_SOLVER"
+_selected_backend: str | None = None
+
+
+def _cbc_runs() -> bool:
+    """Returns True if PuLP's bundled CBC executable can solve a tiny model."""
+    probe = pulp.LpProblem("cbc_probe", pulp.LpMaximize)
+    var = pulp.LpVariable("probe_x", cat="Binary")
+    probe += var
+    try:
+        probe.solve(pulp.PULP_CBC_CMD(msg=False))
+    except (OSError, pulp.PulpSolverError) as exc:
+        logger.warning("Bundled CBC cannot run on this machine: %s", exc)
+        return False
+    return pulp.LpStatus[probe.status] == "Optimal"
+
+
+def _highs_available() -> bool:
+    """Returns True if the HiGHS solver (highspy) is installed."""
+    return bool(pulp.HiGHS(msg=False).available())
+
+
+def selected_backend() -> str:
+    """Chooses the solver backend once per process and remembers it.
+
+    Returns:
+        "CBC" or "HIGHS".
+
+    Raises:
+        RuntimeError: If no usable solver is installed, with install advice.
+    """
+    global _selected_backend
+    if _selected_backend is not None:
+        return _selected_backend
+
+    forced = os.environ.get(_SOLVER_ENV_VAR, "").strip().upper()
+    if forced in ("CBC", "HIGHS"):
+        _selected_backend = forced
+    elif _cbc_runs():
+        _selected_backend = "CBC"
+    elif _highs_available():
+        _selected_backend = "HIGHS"
+    else:
+        raise RuntimeError(
+            "No usable MILP solver: PuLP's bundled CBC cannot run on this "
+            "machine (on Apple-silicon Macs it is an Intel-only program) and "
+            "HiGHS is not installed. Run: pip install -r requirements.txt "
+            "(or pip install highspy==1.13)."
+        )
+    logger.info("Assignment engine using solver backend %s", _selected_backend)
+    return _selected_backend
+
+
+def _make_solver(time_limit_seconds: int | None) -> pulp.LpSolver:
+    """Builds a silent solver instance for the selected backend."""
+    if selected_backend() == "HIGHS":
+        return pulp.HiGHS(msg=False, timeLimit=time_limit_seconds)
+    return pulp.PULP_CBC_CMD(msg=False, timeLimit=time_limit_seconds)
+
+
+# Relative tolerance used when fixing the primary objective before the
+# lexicographic tie-break solve.
+_LEXICOGRAPHIC_TOLERANCE = 1e-6
+
+
+def _preference_utility(
+    student: models.Student, project: models.Project, max_preferences: int
+) -> float:
+    """Borda-style preference score: |R|+1-r for ranked projects, else 0."""
+    rank = student.get_preference_rank(project.id)
+    if rank is None:
+        return 0.0
+    return float(max(max_preferences - rank + 1, 0))
+
+
+def _skill_utility(
+    student: models.Student, project: models.Project, max_preferences: int
+) -> float:
+    """Normalized skill fit sigma_{s,p} in [0, 1]."""
+    score, _unmet = metrics.calculate_assignment_skill_fit(student, project)
+    return score
 
 
 class AssignmentStrategy(abc.ABC):
@@ -61,12 +163,35 @@ class AssignmentStrategy(abc.ABC):
             Numerical weight reflecting desirability in optimization objective.
         """
 
+    def secondary_utility(
+        self,
+        student: models.Student,
+        project: models.Project,
+        max_preferences: int,
+    ) -> float | None:
+        """Optional tie-break weight used after the primary objective.
+
+        Among all allocations that are optimal for the primary objective, the
+        solver picks the one maximizing this secondary weight. Returning None
+        disables the tie-break stage.
+
+        Args:
+            student: The candidate student.
+            project: The target semester project.
+            max_preferences: Maximum number of preferences ranked in cohort.
+
+        Returns:
+            The secondary weight, or None if the strategy has no tie-break.
+        """
+        return None
+
     def solve(
         self,
         students: list[models.Student],
         projects: list[models.Project],
         fixed_assignments: list[models.FixedAssignment] | None = None,
         excluded_solutions: list[list[tuple[str, str]]] | None = None,
+        time_limit_seconds: int | None = None,
     ) -> tuple[str, list[models.Assignment], float | None, dict[str, Any]]:
         """Solves the assignment problem under this strategy's formulation.
 
@@ -74,18 +199,21 @@ class AssignmentStrategy(abc.ABC):
         from `calculate_cost_or_utility`. Shared across strategies so each
         subclass only needs to define how a (student, project) pair is scored.
 
-        In accordance with Section 8 of the specification:
-        - Assigns students to projects respecting capacities [min_capacity, max_capacity].
-        - Enforces each student receives exactly one project allocation.
-        - Strictly preserves pre-allocated fixed assignments.
-        - Supports integer no-good cuts (excluded_solutions) to guarantee distinct
-          Pareto alternatives.
+        Hard constraints (identical for every strategy):
+        - Each student receives exactly one project.
+        - Project headcount stays within [min_capacity, max_capacity].
+        - Fixed assignments are locked (x = 1).
+        - Mandatory skills: a staffed project has at least one assigned
+          student meeting each of its mandatory requirements.
+        - No-good cuts exclude every previously returned allocation, which
+          guarantees each new solution is distinct.
 
         Args:
             students: List of students in the cohort.
             projects: List of available semester projects.
             fixed_assignments: Pre-assigned student-project pairs that must hold.
             excluded_solutions: Previous solution allocations to cut out.
+            time_limit_seconds: Optional solver time limit per solve.
 
         Returns:
             A tuple of (solver_status, assignments, objective_value, diagnostics).
@@ -108,11 +236,12 @@ class AssignmentStrategy(abc.ABC):
         }
 
         # Objective: maximize total utility from calculate_cost_or_utility.
-        prob += pulp.lpSum(
+        primary_expr = pulp.lpSum(
             self.calculate_cost_or_utility(s, p, max_preferences) * x[s.id, p.id]
             for s in students
             for p in projects
         )
+        prob += primary_expr
 
         # Each student must be assigned to exactly one project.
         for s in students:
@@ -126,6 +255,24 @@ class AssignmentStrategy(abc.ABC):
             total = pulp.lpSum(x[s.id, p.id] for s in students)
             prob += total >= p.min_capacity, f"min_cap_{p.id}"
             prob += total <= p.max_capacity, f"max_cap_{p.id}"
+
+        # Mandatory skill coverage: u_p * sum_{s in Q_pk} x_sp >= sum_s x_sp.
+        # If anyone is assigned to p, at least one qualified student must be.
+        for p in projects:
+            for req in p.requirements:
+                if not req.is_mandatory:
+                    continue
+                qualified = [
+                    s
+                    for s in students
+                    if s.get_skill_level(req.skill_id) >= req.minimum_level
+                ]
+                prob += (
+                    p.max_capacity
+                    * pulp.lpSum(x[s.id, p.id] for s in qualified)
+                    >= pulp.lpSum(x[s.id, p.id] for s in students),
+                    f"mandatory_{p.id}_{req.skill_id}",
+                )
 
         # Pre-allocated assignments are locked in place.
         for fa in fixed_assignments:
@@ -145,8 +292,39 @@ class AssignmentStrategy(abc.ABC):
                     f"no_good_{i}",
                 )
 
-        solver_status_code = prob.solve(pulp.PULP_CBC_CMD(msg=False))
-        solver_status = pulp.LpStatus[solver_status_code]
+        solver = _make_solver(time_limit_seconds)
+        started = time.perf_counter()
+        solver_status = pulp.LpStatus[prob.solve(solver)]
+        primary_value = (
+            pulp.value(prob.objective) if solver_status == "Optimal" else None
+        )
+
+        # Lexicographic tie-break: keep the primary optimum, improve secondary.
+        tie_break_used = False
+        if solver_status == "Optimal" and primary_value is not None:
+            secondary_weights = {
+                (s.id, p.id): self.secondary_utility(s, p, max_preferences)
+                for s in students
+                for p in projects
+            }
+            if all(w is not None for w in secondary_weights.values()):
+                tolerance = _LEXICOGRAPHIC_TOLERANCE * max(1.0, abs(primary_value))
+                prob += (
+                    primary_expr >= primary_value - tolerance,
+                    "lexicographic_primary",
+                )
+                prob.setObjective(
+                    pulp.lpSum(
+                        secondary_weights[key] * var for key, var in x.items()
+                    )
+                )
+                second_status = pulp.LpStatus[prob.solve(solver)]
+                if second_status == "Optimal":
+                    tie_break_used = True
+                    primary_value = pulp.value(primary_expr)
+                else:
+                    solver_status = second_status
+        solve_seconds = round(time.perf_counter() - started, 4)
 
         fixed_pairs = {(fa.student_id, fa.project_id) for fa in fixed_assignments}
 
@@ -172,7 +350,9 @@ class AssignmentStrategy(abc.ABC):
                         break
 
         objective_value = (
-            pulp.value(prob.objective) if solver_status == "Optimal" else None
+            round(primary_value, 6)
+            if solver_status == "Optimal" and primary_value is not None
+            else None
         )
 
         diagnostics = {
@@ -180,15 +360,24 @@ class AssignmentStrategy(abc.ABC):
             "solver_status": solver_status,
             "num_students": len(students),
             "num_projects": len(projects),
+            "num_variables": len(x),
+            "num_constraints": len(prob.constraints),
             "num_fixed": len(fixed_assignments),
             "num_excluded_cuts": len(excluded_solutions),
+            "solver_backend": selected_backend(),
+            "lexicographic_tie_break": tie_break_used,
+            "solve_time_seconds": solve_seconds,
         }
 
         return solver_status, assignments, objective_value, diagnostics
 
 
 class PreferenceOrientedSolver(AssignmentStrategy):
-    """Maximizes aggregate student preference satisfaction (Section 7.1)."""
+    """Maximizes aggregate student preference satisfaction (Section 7.1).
+
+    Primary: Borda score sum_s sum_p (|R|+1-r_sp) x_sp.
+    Tie-break: total skill fit among preference-optimal allocations.
+    """
 
     def __init__(self) -> None:
         super().__init__(
@@ -205,14 +394,23 @@ class PreferenceOrientedSolver(AssignmentStrategy):
         project: models.Project,
         max_preferences: int,
     ) -> float:
-        rank = student.get_preference_rank(project.id)
-        if rank is None:
-            return 0.0
-        return float(max_preferences - rank + 1)
+        return _preference_utility(student, project, max_preferences)
+
+    def secondary_utility(
+        self,
+        student: models.Student,
+        project: models.Project,
+        max_preferences: int,
+    ) -> float | None:
+        return _skill_utility(student, project, max_preferences)
 
 
 class SkillFitOrientedSolver(AssignmentStrategy):
-    """Maximizes aggregate student-project technical skill fit (Section 7.2)."""
+    """Maximizes aggregate student-project technical skill fit (Section 7.2).
+
+    Primary: total skill fit sum_s sum_p sigma_sp x_sp.
+    Tie-break: Borda preference score among skill-optimal allocations.
+    """
 
     def __init__(self) -> None:
         super().__init__(
@@ -229,13 +427,26 @@ class SkillFitOrientedSolver(AssignmentStrategy):
         project: models.Project,
         max_preferences: int,
     ) -> float:
-        score, _unmet = metrics.calculate_assignment_skill_fit(student, project)
         # Scale to a comparable magnitude with preference-rank utilities.
-        return score * max(max_preferences, 1)
+        return _skill_utility(student, project, max_preferences) * max(
+            max_preferences, 1
+        )
+
+    def secondary_utility(
+        self,
+        student: models.Student,
+        project: models.Project,
+        max_preferences: int,
+    ) -> float | None:
+        return _preference_utility(student, project, max_preferences)
 
 
 class BalancedTradeoffSolver(AssignmentStrategy):
-    """Blends preference satisfaction and skill fit into one objective."""
+    """Blends preference satisfaction and skill fit into one objective.
+
+    Primary: sum_s sum_p [w * pi_sp + (1 - w) * sigma_sp] x_sp, where pi_sp is
+    the Borda score normalized to [0, 1]. No tie-break stage.
+    """
 
     def __init__(self, preference_weight: float = 0.5) -> None:
         super().__init__(
@@ -252,15 +463,10 @@ class BalancedTradeoffSolver(AssignmentStrategy):
         project: models.Project,
         max_preferences: int,
     ) -> float:
-        rank = student.get_preference_rank(project.id)
-        pref_component = (
-            0.0
-            if rank is None
-            else (max_preferences - rank + 1) / max(max_preferences, 1)
-        )
-        skill_component, _unmet = metrics.calculate_assignment_skill_fit(
-            student, project
-        )
+        pref_component = _preference_utility(
+            student, project, max_preferences
+        ) / max(max_preferences, 1)
+        skill_component = _skill_utility(student, project, max_preferences)
         return (
             self.preference_weight * pref_component
             + (1.0 - self.preference_weight) * skill_component
@@ -281,6 +487,29 @@ def _resolve_strategy(strategy_key: str) -> AssignmentStrategy:
     """Instantiates the strategy for a given key, defaulting to PREFERENCE."""
     strategy_cls = _STRATEGY_REGISTRY.get(strategy_key, PreferenceOrientedSolver)
     return strategy_cls()
+
+
+def _strategy_sequence(primary_key: str, count: int) -> list[AssignmentStrategy]:
+    """Orders the strategies used for successive alternatives.
+
+    Alternative 1 always uses the selected primary strategy. Alternatives 2
+    and 3 use the remaining strategies so the user sees genuine trade-offs;
+    any further alternatives return to the primary strategy.
+
+    Args:
+        primary_key: The strategy chosen by the user.
+        count: Number of alternatives requested.
+
+    Returns:
+        Strategy instances, one per requested alternative.
+    """
+    primary = _resolve_strategy(primary_key)
+    others = [key for key in _STRATEGY_REGISTRY if key != primary.name]
+    sequence: list[AssignmentStrategy] = [primary]
+    sequence += [_resolve_strategy(key) for key in others]
+    while len(sequence) < count:
+        sequence.append(_resolve_strategy(primary.name))
+    return sequence[:count]
 
 
 class AssignmentEngine(contract.AssignmentEngineContract):
@@ -330,13 +559,33 @@ class AssignmentEngine(contract.AssignmentEngineContract):
             infeasibility_reasons=list(val_result.infeasibility_reasons),
         )
 
+    def _stopped_run(
+        self,
+        run_id: str,
+        created_at: str,
+        status: contract.RunStatus,
+        configuration: dict[str, Any],
+        diagnostics: dict[str, Any],
+    ) -> models.AssignmentRun:
+        """Persists and returns a run that produced no solutions."""
+        run = models.AssignmentRun(
+            id=run_id,
+            created_at=created_at,
+            status=status.value,
+            configuration=configuration,
+            solutions=[],
+            diagnostics={"distinct_alternatives": 0, **diagnostics},
+        )
+        self.run_repo.save_run(run)
+        return run
+
     def execute_run(
         self, request: contract.RunRequest
     ) -> models.AssignmentRun:
         """Executes the assignment algorithm, calculates metrics, and persists run.
 
         In accordance with Section 8 of the specification:
-        1. Validates cohort feasibility.
+        1. Validates cohort feasibility and input integrity.
         2. Synchronizes entities to maintain relational integrity.
         3. Runs the assignment solver to generate distinct alternatives,
            applying no-good cuts until max_alternatives is reached or no
@@ -353,30 +602,57 @@ class AssignmentEngine(contract.AssignmentEngineContract):
         """
         run_id = str(uuid.uuid4())
         created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        requested = max(1, request.max_alternatives)
+        strategies = _strategy_sequence(request.strategy_key, requested)
         base_configuration = {
             "max_alternatives": request.max_alternatives,
-            "primary_strategy": request.strategy_key,
+            "primary_strategy": strategies[0].name,
+            "strategy_sequence": [s.name for s in strategies],
             "engine": "AssignmentEngine",
+            "method": "ILP (PuLP) with no-good cuts",
+            "solver_backend": selected_backend(),
+            "notes": request.notes,
         }
 
+        # 1a. Structural infeasibility proven before solving.
         val_outcome = self.validate_inputs(request)
         if not val_outcome.is_feasible:
-            run = models.AssignmentRun(
-                id=run_id,
-                created_at=created_at,
-                status=contract.RunStatus.INFEASIBLE.value,
-                configuration=base_configuration,
-                solutions=[],
-                diagnostics={
+            return self._stopped_run(
+                run_id,
+                created_at,
+                contract.RunStatus.INFEASIBLE,
+                base_configuration,
+                {
                     "solver_status": "INFEASIBLE",
+                    "message": "Infeasibility proven by pre-solve validation.",
                     "reasons": val_outcome.infeasibility_reasons,
-                    "distinct_alternatives": 0,
+                    "errors": [
+                        e
+                        for e in val_outcome.errors
+                        if e not in val_outcome.infeasibility_reasons
+                    ],
+                    "warnings": val_outcome.warnings,
                 },
             )
-            self.run_repo.save_run(run)
-            return run
 
-        # Synchronize entities to maintain relational integrity.
+        # 1b. Invalid references (unknown IDs, duplicates, conflicting locks)
+        # are rejected before anything touches the database or solver.
+        if not val_outcome.is_valid:
+            return self._stopped_run(
+                run_id,
+                created_at,
+                contract.RunStatus.INVALID_INPUT,
+                base_configuration,
+                {
+                    "solver_status": "NOT_SOLVED",
+                    "message": "Input rejected by validation; fix the "
+                    "errors below and run again.",
+                    "errors": val_outcome.errors,
+                    "warnings": val_outcome.warnings,
+                },
+            )
+
+        # 2. Synchronize entities to maintain relational integrity.
         if request.skills:
             skill_repo = repositories.SkillRepository()
             for sk in request.skills:
@@ -395,20 +671,24 @@ class AssignmentEngine(contract.AssignmentEngineContract):
             for fa in request.fixed_assignments:
                 fixed_repo.save(fa)
 
-        strategy = _resolve_strategy(request.strategy_key)
-
+        # 3-4. Generate distinct alternatives with no-good cuts.
+        time_limit = config.Config.PULP_TIME_LIMIT_SECONDS
         solutions: list[models.Solution] = []
         excluded_solutions: list[list[tuple[str, str]]] = []
         last_status = "NOT_SOLVED"
 
-        for alt_idx in range(max(1, request.max_alternatives)):
+        for alt_idx, strategy in enumerate(strategies):
             status, assignments, objective_value, solve_diag = strategy.solve(
                 students=request.students,
                 projects=request.projects,
                 fixed_assignments=request.fixed_assignments,
                 excluded_solutions=excluded_solutions,
+                time_limit_seconds=time_limit,
             )
             last_status = status
+            # The cuts are identical whichever objective is used, so an
+            # infeasible model here means no further distinct allocation
+            # exists for any strategy.
             if status != "Optimal" or not assignments:
                 break
 
@@ -427,7 +707,7 @@ class AssignmentEngine(contract.AssignmentEngineContract):
                 objective_value=objective_value,
                 assignments=assignments,
                 indicators=indicators,
-                warnings=[],
+                warnings=list(indicators["feasibility"]["violations"]),
                 diagnostics=solve_diag,
             )
             solutions.append(solution)
@@ -435,11 +715,41 @@ class AssignmentEngine(contract.AssignmentEngineContract):
                 [(a.student_id, a.project_id) for a in assignments]
             )
 
-        status_value = (
-            contract.RunStatus.COMPLETED.value
-            if solutions
-            else contract.RunStatus.INFEASIBLE.value
-        )
+        run_diagnostics: dict[str, Any] = {
+            "solver_status": last_status,
+            "distinct_alternatives": len(solutions),
+            "requested_alternatives": requested,
+            "warnings": val_outcome.warnings,
+        }
+
+        if not solutions:
+            run_diagnostics["message"] = (
+                "The solver proved that no allocation satisfies all hard "
+                "constraints together, although each passed the pre-solve "
+                "checks individually."
+            )
+            run_diagnostics["reasons"] = [
+                f"Solver status '{last_status}' for the model with exact "
+                "allocation, capacity bounds, fixed locks and mandatory "
+                "skill coverage.",
+                "Typical causes: mandatory skills held by too few students "
+                "for the projects that must be staffed (min capacity > 0), "
+                "or fixed locks that leave no room for qualified students.",
+            ]
+            status_value = contract.RunStatus.INFEASIBLE.value
+        else:
+            status_value = contract.RunStatus.COMPLETED.value
+            if len(solutions) < requested:
+                run_diagnostics["message"] = (
+                    f"Only {len(solutions)} distinct feasible allocation(s) "
+                    f"exist; {requested} were requested. No duplicates were "
+                    "generated."
+                )
+            else:
+                run_diagnostics["message"] = (
+                    f"{len(solutions)} distinct alternatives generated "
+                    f"({', '.join(s.strategy_name for s in solutions)})."
+                )
 
         run = models.AssignmentRun(
             id=run_id,
@@ -447,10 +757,7 @@ class AssignmentEngine(contract.AssignmentEngineContract):
             status=status_value,
             configuration=base_configuration,
             solutions=solutions,
-            diagnostics={
-                "solver_status": last_status,
-                "distinct_alternatives": len(solutions),
-            },
+            diagnostics=run_diagnostics,
         )
         self.run_repo.save_run(run)
         return run

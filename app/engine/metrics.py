@@ -3,16 +3,14 @@
 This module provides analytical functions to evaluate solutions according to
 the requirements in Section 7 of the TECH5 specification.
 
-Students (Team B) must implement these analytical functions to compute
-student-project skill fit, Gini inequality, solution indicators, and
-side-by-side trade-off comparisons.
+Team B implementation: student-project skill fit, Gini inequality of
+assigned ranks, solution indicators, and side-by-side trade-off comparisons.
 """
 
+import collections
 from typing import Any
 
 from app.domain import models
-
-import collections
 
 
 def calculate_assignment_skill_fit(
@@ -31,9 +29,6 @@ def calculate_assignment_skill_fit(
 
     Returns:
         A tuple of (skill_fit_score [0.0, 1.0], list_of_unmet_skill_ids).
-
-    Raises:
-        NotImplementedError: To be implemented by Team B.
     """
 
     if not project.requirements:
@@ -65,9 +60,6 @@ def calculate_gini(values: list[float]) -> float:
 
     Returns:
         The Gini coefficient in [0.0, 1.0].
-
-    Raises:
-        NotImplementedError: To be implemented by Team B.
     """
     if not values:
         return 0.0
@@ -112,9 +104,6 @@ def compute_solution_indicators(
             "fairness": {"mean_rank": float, "worst_rank": int, "rank_gini": float, ...},
             "capacity": {"overall_utilization_pct": float, "projects": dict, ...}
         }
-
-    Raises:
-        NotImplementedError: To be implemented by Team B.
     """
     fixed_assignments = fixed_assignments or []
     student_map = {s.id: s for s in students}
@@ -159,25 +148,40 @@ def compute_solution_indicators(
                 "not preserved."
             )
 
-    # Mandatory (hard) and soft skill requirements.
-    mandatory_unmet = 0
-    soft_unmet = 0
+    # Mandatory (hard) skill coverage: every staffed project needs at least
+    # one assigned student meeting each mandatory requirement. Individual
+    # shortfalls on mandatory skills are reported but are not violations.
+    members: dict[str, list[models.Student]] = collections.defaultdict(list)
     for a in assignments:
         student = student_map.get(a.student_id)
-        project = project_map.get(a.project_id)
-        if student is None or project is None:
-            continue
-        for req in project.requirements:
-            if student.get_skill_level(req.skill_id) >= req.minimum_level:
+        if student is not None:
+            members[a.project_id].append(student)
+
+    mandatory_unmet = 0
+    mandatory_total = 0
+    mandatory_individual_shortfalls = 0
+    soft_unmet = 0
+    for p in projects:
+        team = members.get(p.id, [])
+        for req in p.requirements:
+            short = [
+                s for s in team
+                if s.get_skill_level(req.skill_id) < req.minimum_level
+            ]
+            if not req.is_mandatory:
+                soft_unmet += len(short)
                 continue
-            if req.is_mandatory:
+            if not team:
+                continue
+            mandatory_total += 1
+            mandatory_individual_shortfalls += len(short)
+            if len(short) == len(team):
                 mandatory_unmet += 1
                 violations.append(
-                    f"Student {student.id} lacks mandatory skill "
-                    f"{req.skill_id} for project {project.id}."
+                    f"Project {p.id} has no assigned student meeting "
+                    f"mandatory skill {req.skill_id} "
+                    f"(level {req.minimum_level})."
                 )
-            else:
-                soft_unmet += 1
 
     # 2. Efficiency.
     n = len(assignments)
@@ -237,6 +241,9 @@ def compute_solution_indicators(
             "assigned_count": len(allocated),
             "total_students": len(students),
             "mandatory_unmet_count": mandatory_unmet,
+            "mandatory_requirements_covered": mandatory_total - mandatory_unmet,
+            "mandatory_requirements_total": mandatory_total,
+            "mandatory_individual_shortfalls": mandatory_individual_shortfalls,
         },
         "efficiency": {
             "mean_skill_fit": round(mean_fit, 4),
@@ -262,37 +269,6 @@ def compute_solution_indicators(
         },
     }
 
-def compare_two_solutions(
-    solution_a: models.Solution,
-    solution_b: models.Solution,
-) -> dict[str, Any]:
-    """Performs detailed trade-off comparison between two alternative solutions.
-
-    In compliance with Section 7.4 of the specification, identifies:
-    - Changed student allocations between solutions A and B.
-    - Improved and worsened student preference ranks.
-    - Deltas in mean skill-fit, mean rank, and Gini coefficient.
-    - Human-readable trade-off summary statements.
-
-    Args:
-        solution_a: Baseline solution.
-        solution_b: Alternative solution to compare against A.
-
-    Returns:
-        Dictionary documenting differences, changed assignments, and trade-offs:
-        {
-            "solution_a_id": str,
-            "solution_b_id": str,
-            "is_distinct": bool,
-            "changed_students_count": int,
-            "changed_assignments": list[dict[str, Any]],
-            "delta_metrics": dict[str, Any],
-            "trade_off_summary": list[str]
-        }
-
-    Raises:
-        NotImplementedError: To be implemented by Team B.
-    """
 def _section_value(
     solution: models.Solution, section: str, key: str
 ) -> float | None:

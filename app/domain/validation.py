@@ -132,15 +132,18 @@ def validate_cohort(
                     f"Student '{student.id}' ranked unknown project "
                     f"'{pref.project_id}'."
                 )
+            # A strict ranking is required (the schema enforces unique
+            # (student, project) and (student, rank) pairs), so ties inside
+            # one student's list are rejected rather than silently stored.
             if pref.project_id in seen_preferred_projects:
-                result.warnings.append(
+                result.errors.append(
                     f"Student '{student.id}' has multiple preferences for "
                     f"project '{pref.project_id}'."
                 )
             seen_preferred_projects.add(pref.project_id)
 
             if pref.rank in seen_ranks:
-                result.warnings.append(
+                result.errors.append(
                     f"Student '{student.id}' has duplicate rank {pref.rank}."
                 )
             seen_ranks.add(pref.rank)
@@ -230,7 +233,7 @@ def validate_cohort(
                     for s in students
                     if s.get_skill_level(req.skill_id) >= req.minimum_level
                 ]
-                if not qualified_students:
+                if not qualified_students and project.min_capacity > 0:
                     result.is_feasible = False
                     msg = (
                         f"Mandatory requirement impossible: No student in "
@@ -240,6 +243,13 @@ def validate_cohort(
                     )
                     result.errors.append(msg)
                     result.infeasibility_reasons.append(msg)
+                elif not qualified_students:
+                    # Optional project (min 0): it can still run empty.
+                    result.warnings.append(
+                        f"No student meets mandatory skill '{req.skill_id}' "
+                        f"(level {req.minimum_level}) for project "
+                        f"'{project.id}'; it will be left empty."
+                    )
 
     if result.errors:
         result.is_valid = False

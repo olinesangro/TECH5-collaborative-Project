@@ -19,3 +19,7 @@ pytest==9.1.1
 typing-inspection==0.4.4
 typing_extensions==4.16.0
 Werkzeug==3.1.9
+# HiGHS solver, installed only on Apple-silicon Macs, where PuLP's bundled
+# CBC (an Intel-only program) cannot run without Rosetta. Same pin as PuLP's
+# own "highs" extra. Everyone else keeps using the bundled CBC.
+highspy==1.13; sys_platform == "darwin" and platform_machine == "arm64"
