@@ -21,6 +21,9 @@ def test_assignment_engine_initialization() -> None:
     assert isinstance(engine.strategies, dict)
 
 
+@pytest.mark.skip(
+    reason="Starter-carcass test; ignored per teacher announcement 28 Oct."
+)
 def test_assignment_engine_raises_not_implemented() -> None:
     """Verifies that execute_run raises NotImplementedError for Team B."""
     engine = solvers.AssignmentEngine()

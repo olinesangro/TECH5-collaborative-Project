@@ -10,13 +10,6 @@
   </div>
 
   <div class="card-body">
-    <!-- TODO (Team A): Implement Project Creation/Edit Form -->
-    <div class="alert alert-info" style="margin-bottom: 1.5rem;">
-      <strong>Team A Starter Carcass:</strong>
-      Implement the form fields below to capture project attributes (ID, title, description, min/max capacities)
-      and the project skill requirements matrix (proficiency levels 1–5 and mandatory constraint flags).
-    </div>
-
     <form action="{% if project %}{{ url_for('visualization_web.update_project', project_id=project.id) }}{% else %}{{ url_for('visualization_web.create_project') }}{% endif %}" method="POST">
       <div class="grid-2">
         <div class="form-group">
@@ -50,12 +43,10 @@
         </div>
       </div>
 
-      <!-- TODO (Team A): Implement Skill Requirements Matrix -->
       <div class="form-group" style="margin-top: 1rem;">
         <label class="form-label">Skill Requirements:</label>
         <div style="background: #f8fafc; border: 1px solid var(--border-color); border-radius: var(--radius-md); padding: 1rem;">
           <p style="color: var(--text-muted); font-size: 0.88rem; margin-bottom: 0.75rem;">
-            <!-- TODO (Team A): Loop over catalogued skills, provide minimum level input and mandatory checkbox -->
             Configure required skill proficiency levels (0-5) and designate mandatory requirements:
           </p>
           <table class="data-table" style="background: transparent;">

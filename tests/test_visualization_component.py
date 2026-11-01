@@ -92,7 +92,7 @@ def test_scenario_loading_and_optimization_trigger(
     assert load_res.status_code == 200
     assert b"Standard Cohort" in load_res.data
 
-    # Trigger optimization run (falls back to mock engine if solver unimplemented)
+    # Trigger optimization run (mock engine is used if the solver is absent)
     run_res = client.post(
         "/runs/trigger",
         data={

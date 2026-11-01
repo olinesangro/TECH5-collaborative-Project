@@ -2,157 +2,189 @@
 
 ## 1. Demonstration Overview
 
-This guide provides instructors, evaluators, and students with an exact, reproducible walkthrough of the **Student-to-Project Assignment Decision Support System**. It exercises all core functional capabilities across the four benchmark cohorts pre-configured in the platform.
+This walkthrough reproduces every core capability of the
+**Student-to-Project Assignment Decision Support System** on the four
+benchmark cohorts built into the application. All numbers below were produced
+by our implementation (ILP solved with PuLP/CBC) and are deterministic for the
+benchmark data.
 
-### Quick Start
-1. Ensure the virtual environment is activated:
-   ```powershell
-   .\.venv\Scripts\activate
-   ```
-2. Start the integrated application:
-   ```powershell
-   python run.py
-   ```
-3. Open your browser to: **`http://127.0.0.1:5000`**
+### Setup and Quick Start (Windows)
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+pytest -v
+python run.py
+```
+
+On macOS/Linux, activate with `source .venv/bin/activate`.
+
+- `pytest -v` should end with **38 passed, 1 skipped, 12 xpassed** and no
+  failures. The skipped test is the starter-carcass check
+  `test_assignment_engine_raises_not_implemented`, which the course
+  instructions say to ignore.
+- Open **http://127.0.0.1:5000** in a browser. Stop the server with Ctrl+C.
 
 ---
 
 ## 2. Scenario 1: Standard Cohort (Trade-Off Benchmark)
 
-### 2.1 Scenario Objective
-Demonstrates multi-objective Pareto alternatives, distinct solutions generation via no-good integer cuts, and comparative trade-off analysis between student preference satisfaction and project skill fit.
+### 2.1 Objective
 
-### 2.2 Cohort Composition
-- **Students**: 10 students (`S01` to `S10`) with complementary competencies across Python, SQL, Machine Learning, Web Dev, and FinTech.
-- **Projects**: 4 projects (`P1`: FinTech, `P2`: Data Lakehouse, `P3`: Healthcare ML, `P4`: Full-Stack Web) with capacity bounds $[1, 3]$ each (Total Capacity = 12 $\ge 10$ students).
-- **Constraints**: No fixed pre-allocations initially.
+Shows distinct alternatives generated with no-good cuts, and the trade-off
+between student preference satisfaction and project skill fit.
 
-### 2.3 Step-by-Step Execution (Web Interface)
-1. In the top navigation, click **Dashboard** or **Scenarios**.
-2. Click the green button **"Load Scenario"** under **Standard Trade-Off Benchmark**.
-3. A success notification will confirm the cohort is loaded into SQLite (10 students, 4 projects, 5 skills).
-4. In the **Optimization Run Trigger Panel**:
-   - Strategy: `Student Preference Maximization (Minimize Rank Regret)`
-   - Distinct Alternatives: `3 Distinct Solutions`
-   - Click **"Launch Optimization Run"**.
-5. You are redirected to `/runs/{run_id}`:
-   - Notice that **3 distinct solutions** have been computed and persisted.
-   - **Alternative 1 (Preference-Oriented)**:
-     - Mean Skill Fit: ~`82.5%`
-     - Mean Preference Rank: ~`1.20` (8 students get 1st choice, 2 get 2nd choice)
-     - Worst Rank: `2`
-     - Gini Inequality: `0.167`
-   - **Alternative 2 (Skill-Fit Oriented)**:
-     - Mean Skill Fit increases to ~`92.5%`
-     - Mean Preference Rank adjusts to ~`1.50`
-   - **Alternative 3 (Balanced Trade-Off)**:
-     - Provides an egalitarian compromise between skill fit and preference satisfaction.
+### 2.2 Cohort
 
-### 2.4 Side-by-Side Solution Comparison
-1. In the top navigation, click **Compare**.
-2. Select:
-   - Solution A: `Alternative 1 (PREFERENCE)`
-   - Solution B: `Alternative 2 (SKILL_FIT)`
-   - Click **"Compare Solutions"**.
-3. The comparison dashboard displays:
-   - **Delta Metrics**: Visual indicator badges displaying $\Delta$ Mean Skill Fit (+10.0%), $\Delta$ Mean Rank (+0.30), and $\Delta$ Gini.
-   - **Re-Allocation Table**: Highlights the exact students who moved projects, along with their individual rank change ($\Delta Rank$).
+- **Students:** 10 (`S01`–`S10`) with five skills.
+- **Projects:** 4 (`P1`–`P4`), total maximum capacity 12 for 10 students.
+- **Fixed assignments:** none.
 
-### 2.5 Inspecting Decision-Support Recommendations
-1. Navigate into any generated solution (e.g. `/solutions/{solution_id}`).
-2. The **Decision Support & Recommendations Panel** presents three inspectable recommendations:
-   - **Student Preference Maximization**: Identifies the alternative with lowest average rank and minimum regret, supported by exact calculated metrics.
-   - **Project Skill Quality Assurance**: Identifies the alternative with maximum skill fit and minimum unmet soft requirements.
-   - **Balanced Egalitarian Compromise**: Identifies the alternative minimizing the rank Gini coefficient and rank variance.
-3. Each recommendation explicitly details the **criteria evaluated**, the **calculated evidence**, and the **administrative policy advice**, distinguishing objective facts from normative guidance.
+### 2.3 Steps
 
-### 2.6 Headless In-Process Contract Execution (Python)
-The Assignment Engine can be invoked directly in Python without starting the web server, demonstrating contract independence:
+1. Click **Scenarios**, then **Load Standard Benchmark →**.
+2. On the **Dashboard**, keep the strategy *Student Preference Maximization*
+   and *3 Distinct Solutions*, then click **Launch Optimization Run →**.
+3. The run page reports *"Optimization run completed! Found 3 distinct
+   alternative solutions."*
+
+| Alternative | Strategy   | Mean skill fit | Mean rank | Rank Gini | Choices          |
+|-------------|------------|----------------|-----------|-----------|------------------|
+| 1           | PREFERENCE | 0.983          | 1.0       | 0.000     | 10 × 1st         |
+| 2           | SKILL_FIT  | 1.000          | 1.1       | 0.082     | 9 × 1st, 1 × 2nd |
+| 3           | BALANCED   | 0.983          | 1.1       | 0.082     | 9 × 1st, 1 × 2nd |
+
+Alternatives 2 and 3 are the best allocations for their strategy *among
+allocations that differ from the earlier ones* (no-good cuts). Alternative 3
+is therefore no better than alternative 1 on these indicators; the
+recommendations page evaluates alternatives by their indicators, not by
+their strategy label.
+
+### 2.4 Side-by-Side Comparison
+
+1. Click **Compare**. Choose Solution A = *Alt #1 – PREFERENCE* and
+   Solution B = *Alt #2 – SKILL_FIT*, then click **Compare Allocations →**.
+2. Expected result: **1 student changed** (`S06`, from 1st to 2nd choice),
+   Δ average skill fit **+1.7%**, Δ average rank **+0.1**,
+   Δ rank Gini **+0.0818**.
+
+### 2.5 Transparent Recommendations
+
+1. Open the run (Dashboard → **View Solutions →**) and click
+   **View Recommendations →**.
+2. Three cards appear (Student Preference, Project Skill Quality, Balanced).
+   Each shows the **criteria used**, the **calculated evidence** and the
+   **policy advice** separately. When one alternative wins several
+   priorities, or two alternatives tie, a **Decision notes** box says so.
+
+### 2.6 Headless Contract Execution (Python)
+
+The engine runs without the web server, through the component contract:
+
 ```python
+from app import create_app
 from app.contract import contract
 from app.engine import solvers
+from app.samples import demo_data
 
-# Initialize the engine (implements contract.AssignmentEngineContract)
-engine = solvers.AssignmentEngine()
+create_app({"DATABASE_PATH": "demo.db"})  # initialises the database
 
-# Prepare structured run request
+data = demo_data.get_standard_scenario()
 request = contract.RunRequest(
-    primary_strategy="PREFERENCE",
+    students=data["students"],
+    projects=data["projects"],
+    skills=data["skills"],
+    strategy_key="PREFERENCE",
     max_alternatives=3,
 )
-
-# Execute optimization via the internal contract
-outcome = engine.execute_run(request)
-print(f"Status: {outcome.status.value}")
-print(f"Solutions generated: {len(outcome.solutions)}")
-for sol in outcome.solutions:
-    print(f"Alt {sol.alternative_number} ({sol.strategy_name}): "
-          f"Mean Rank={sol.indicators['fairness']['mean_rank']}, "
-          f"Mean Skill Fit={sol.indicators['efficiency']['mean_skill_fit']:.2f}")
+run = solvers.AssignmentEngine().execute_run(request)
+print(run.status, len(run.solutions))
+for sol in run.solutions:
+    print(sol.alternative_number, sol.strategy_name,
+          sol.indicators["fairness"]["mean_rank"],
+          sol.indicators["efficiency"]["mean_skill_fit"])
 ```
 
----
-
-## 3. Scenario 2: Fixed Assignment & Ripple Effect Analysis
-
-### 3.1 Scenario Objective
-Demonstrates administrative pre-allocation locks ($x_{s^*, p^*} = 1$), strict constraint preservation, and the resulting ripple effect on peer assignments.
-
-### 3.2 Cohort Composition
-- Base standard cohort with student **`S02` (Bob Smith)** locked to project **`P2` (Cloud Data Pipeline)** under an approved research grant, even though Bob's #1 preference is `P1`.
-
-### 3.3 Step-by-Step Execution
-1. Navigate to **Scenarios** and click **Load Scenario** under **Fixed Assignment Scenario**.
-2. In the top navigation, click **Fixed Locks**.
-   - Notice `S02` $\to$ `P2` is listed with status `APPROVED` and justification noted.
-3. Return to **Dashboard** and click **"Launch Optimization Run"**.
-4. Inspect the generated solution:
-   - In Solution 1, student `S02` is strictly assigned to `P2` (`Fixed: YES` badge).
-   - Because `P2` now has 1 fewer open seat, observe how student `S03` or `S07` is re-routed to their 2nd preference.
-5. In the solution view, use the **"Lock Student"** dropdown to interactively pin another student (e.g. `S01` to `P1`) and click **"Save Lock & Re-run Optimization"** to witness real-time interactive re-solving!
+Expected output: `COMPLETED 3`, followed by the three rows of the table in
+section 2.3.
 
 ---
 
-## 4. Scenario 3: Capacity Deficit (Mathematical Infeasibility)
+## 3. Scenario 2: Fixed Assignment and Rerun
 
-### 4.1 Scenario Objective
-Validates that the system rigorously detects structural infeasibility when total project capacity is strictly less than cohort size ($\sum u_p < |S|$), halting before solver failure and providing clear diagnostic guidance.
+### 3.1 Objective
 
-### 4.2 Cohort Composition
-- **Students**: 10 students.
-- **Projects**: Capacities reduced to 2, 2, 1, 1 (Total Capacity = 6 seats for 10 students).
+Shows that administrative locks ($x_{s^*,p^*} = 1$) are always preserved,
+and how a lock affects other students.
 
-### 4.3 Step-by-Step Execution
-1. Navigate to **Scenarios** and click **Load Scenario** under **Capacity Deficit Scenario**.
-2. On the Dashboard KPI cards:
-   - Student Cohort: `10`
-   - Total Max Capacity: `6`
-   - Red Warning: `⚠️ Deficit: 4 unassignable students`
-3. Click **"Launch Optimization Run"**.
-4. The system immediately catches the mathematical violation:
-   - Run Status: `INFEASIBLE`
-   - Diagnostic Banner:
-     ```
-     Insufficient overall capacity: total cohort size (10) exceeds aggregate maximum project capacity (6).
-     ```
-   - Zero solutions are created, and helpful remediation advice is displayed (e.g. increase project capacities or enable partial allocations).
+### 3.2 Cohort
+
+The standard cohort, with student **`S02`** locked to **`P2`** (Cloud Data
+Pipeline & Lakehouse), although `P2` is only S02's 3rd choice.
+
+### 3.3 Steps
+
+1. Click **Scenarios**, then **Load Fixed Assignment Scenario →**.
+2. Click **Fixed Locks**: `S02 → P2` is listed with status `APPROVED`.
+3. On the **Dashboard**, click **Launch Optimization Run →**.
+4. In every alternative, `S02` is in `P2` with a **🔒 FIXED LOCK** badge.
+   Alternative 1 has mean rank **1.2** (9 students get their 1st choice,
+   S02 gets its 3rd) and mean skill fit **0.967**.
+5. Open a solution (**Explore Allocations →**) and click **🔒 Lock & Rerun**
+   on any other student. The lock is saved and a new run starts at once; the
+   new run keeps both locks.
 
 ---
 
-## 5. Scenario 4: Contradictory Fixed Constraints
+## 4. Scenario 3: Capacity Deficit (Infeasibility)
 
-### 5.1 Scenario Objective
-Verifies domain validation and relational integrity rejection when an administrator attempts to lock more students to a project than its maximum capacity ($|F_p| > u_p$).
+### 4.1 Objective
 
-### 5.2 Cohort Composition
-- Project `P1` has a maximum capacity of 3 students.
-- 4 students (`S01`, `S02`, `S05`, `S08`) are locked to `P1`.
+Shows that structural infeasibility ($\sum_p u_p < |S|$) is detected before
+solving and explained to the user.
 
-### 5.3 Step-by-Step Execution
-1. Navigate to **Scenarios** and click **Load Scenario** under **Contradictory Fixed Assignments Scenario**.
-2. Attempt to trigger an optimization run.
-3. The platform displays a clear validation error:
+### 4.2 Steps
+
+1. Click **Scenarios**, then **Load Infeasible Capacity Scenario →**.
+2. The Dashboard shows 10 students, **Total Max Capacity 6** and
+   *⚠ Capacity Deficit*.
+3. Click **Launch Optimization Run →**. Status **INFEASIBLE**, no solutions,
+   and the diagnostics read:
+
+   ```
+   Insufficient overall capacity: total cohort size (10) exceeds aggregate maximum project capacity (6).
+   ```
+
+---
+
+## 5. Scenario 4: Contradictory Fixed Assignments
+
+### 5.1 Objective
+
+Shows that locks exceeding a project's capacity ($|F_p| > u_p$) are rejected
+with a clear reason.
+
+### 5.2 Steps
+
+1. Click **Scenarios**, then **Load Contradictory Scenario →**
+   (4 students locked to `P1`, maximum capacity 3).
+2. Click **Launch Optimization Run →**. Status **INFEASIBLE**, no solutions,
+   and the diagnostics read:
+
    ```
    Fixed assignments (4) for project 'P1' exceed its maximum capacity (3).
    ```
-4. Optimization is safely blocked, protecting database integrity.
+
+---
+
+## 6. Data Entry (Optional)
+
+1. **Skills:** add a skill with the form on the right; delete it again.
+2. **Projects:** **+ Add New Project**, set capacities and skill requirements
+   (level 0–5, mandatory checkbox). **Edit** shows the saved requirements;
+   **Delete** removes the project.
+3. **Students:** add a student with skills and comma-separated preferences.
+4. Invalid input (for example minimum capacity above maximum, or an unknown
+   project in the preferences) is rejected with a message instead of an
+   error page.

@@ -112,25 +112,19 @@ def _check_valid_student_data(
     student_name: str,
     available_students: dict[str, str],
 ) -> bool:
-    """Checks if the student data is valid
+    """Checks that a new student's ID and name are not already in use.
+
     Args:
         student_id: Target student identifier.
         student_name: Target student name.
-        available_students: Map of existing students id and name.
+        available_students: Map of existing student IDs to names.
+
     Returns:
-        A list of invalid students.
+        True if both the ID and the name are unused, otherwise False.
     """
-    
-
-    valid = 1
-
     if student_id in available_students:
-        valid = 0
-    elif student_name in available_students.values():
-        valid = 0
-
-
-    return valid
+        return False
+    return student_name not in available_students.values()
 
 
 def _parse_and_validate_preferences(
@@ -189,11 +183,14 @@ def create_student() -> flask.Response:
     name = flask.request.form.get("display_name", "").strip() or s_id
 
     available_students = {
-        s.id: s.display_name for s in repositories.StudentRepository().list_all()
+        s.id: s.display_name
+        for s in repositories.StudentRepository().list_all()
     }
 
-    if not _check_valid_student_data(s_id,name, available_students):
-        flask.flash(f"Student ID: {s_id}, or Name: {name} already exists.", "danger")
+    if not _check_valid_student_data(s_id, name, available_students):
+        flask.flash(
+            f"Student ID: {s_id}, or Name: {name} already exists.", "danger"
+        )
         return flask.redirect(
             flask.url_for("visualization_web.new_student_form")
         )
@@ -545,6 +542,7 @@ def delete_project(project_id: str) -> flask.Response:
         flask.flash(f"Project '{project_id}' not found.", "warning")
     return flask.redirect(flask.url_for("visualization_web.list_projects"))
 
+
 # -----------------------------------------------------------------------------
 # Skills CRUD & Preferences Editor
 # -----------------------------------------------------------------------------
@@ -585,6 +583,7 @@ def create_skill() -> flask.Response:
     flask.flash(f"Skill '{name}' created.", "info")
     return flask.redirect(flask.url_for("visualization_web.list_skills"))
 
+
 @web_bp.post("/skills/<skill_id>/delete")
 def delete_skill(skill_id: str) -> flask.Response:
     """Deletes a skill record.
@@ -614,6 +613,23 @@ def preferences_overview() -> str:
     return flask.render_template(
         "preferences.html", students=students, projects=projects
     )
+
+
+def _lock_target_error(student_id: str, project_id: str) -> str:
+    """Checks that a student and project exist before locking them.
+
+    Args:
+        student_id: Identifier of the student to lock.
+        project_id: Identifier of the target project.
+
+    Returns:
+        An error message, or an empty string when both exist.
+    """
+    if repositories.StudentRepository().get_by_id(student_id) is None:
+        return f"Student '{student_id}' does not exist."
+    if repositories.ProjectRepository().get_by_id(project_id) is None:
+        return f"Project '{project_id}' does not exist."
+    return ""
 
 
 # -----------------------------------------------------------------------------
@@ -652,6 +668,11 @@ def create_fixed_assignment() -> flask.Response:
         flask.flash("Student and Project must be selected.", "warning")
         return flask.redirect(target)
 
+    error = _lock_target_error(s_id, p_id)
+    if error:
+        flask.flash(error, "danger")
+        return flask.redirect(target)
+
     repositories.FixedAssignmentRepository().save(
         models.FixedAssignment(
             student_id=s_id, project_id=p_id, status=status, reason=reason
@@ -674,7 +695,9 @@ def delete_fixed_assignment(student_id: str) -> flask.Response:
         return flask.redirect(target)
 
     repositories.FixedAssignmentRepository().delete(student_id)
-    flask.flash(f"Fixed assignment for student '{student_id}' removed.", "info")
+    flask.flash(
+        f"Fixed assignment for student '{student_id}' removed.", "info"
+    )
     return flask.redirect(target)
 
 
@@ -744,6 +767,48 @@ def clear_data() -> flask.Response:
 # -----------------------------------------------------------------------------
 
 
+_VALID_STRATEGIES = ("PREFERENCE", "SKILL_FIT", "BALANCED")
+_MAX_ALTERNATIVES = 5
+
+
+def _parse_run_options() -> tuple[str, int]:
+    """Reads and validates the strategy and alternative count of a run.
+
+    Invalid values never crash the request: they are replaced by safe
+    defaults and the user is told what was changed.
+
+    Returns:
+        A tuple (strategy_key, max_alternatives).
+    """
+    form = flask.request.form
+    strategy = form.get("primary_strategy", "PREFERENCE").strip().upper()
+    if strategy not in _VALID_STRATEGIES:
+        flask.flash(
+            f"Unknown strategy '{strategy}'. Using PREFERENCE instead.",
+            "warning",
+        )
+        strategy = "PREFERENCE"
+
+    raw = form.get("max_alternatives", "3").strip()
+    try:
+        max_alts = int(raw)
+    except ValueError:
+        flask.flash(
+            f"'{raw}' is not a whole number of alternatives. Using 3.",
+            "warning",
+        )
+        max_alts = 3
+    if not 1 <= max_alts <= _MAX_ALTERNATIVES:
+        clamped = min(max(max_alts, 1), _MAX_ALTERNATIVES)
+        flask.flash(
+            f"Alternatives must be between 1 and {_MAX_ALTERNATIVES}. "
+            f"Using {clamped}.",
+            "warning",
+        )
+        max_alts = clamped
+    return strategy, max_alts
+
+
 @web_bp.post("/runs/trigger")
 def trigger_run() -> flask.Response:
     """Submits current cohort data to Service A to generate allocations."""
@@ -751,8 +816,7 @@ def trigger_run() -> flask.Response:
         flask.flash("Permission denied for current role.", "danger")
         return flask.redirect(flask.url_for("visualization_web.dashboard"))
 
-    max_alts = int(flask.request.form.get("max_alternatives", 3))
-    strat = flask.request.form.get("primary_strategy", "PREFERENCE")
+    strat, max_alts = _parse_run_options()
 
     students = repositories.StudentRepository().list_all()
     projects = repositories.ProjectRepository().list_all()
@@ -844,16 +908,24 @@ def view_solution(solution_id: str) -> Any:
 @web_bp.post("/solutions/<solution_id>/lock-and-rerun")
 def lock_and_rerun(solution_id: str) -> flask.Response:
     """Locks a student assignment from a solution and triggers a new run."""
-    student_id = flask.request.form.get("student_id")
-    project_id = flask.request.form.get("project_id")
+    back = flask.url_for(
+        "visualization_web.view_solution", solution_id=solution_id
+    )
+    if not auth.can_edit_cohort_data():
+        flask.flash("Permission denied for current role.", "danger")
+        return flask.redirect(back)
+
+    student_id = flask.request.form.get("student_id", "").strip()
+    project_id = flask.request.form.get("project_id", "").strip()
 
     if not student_id or not project_id:
         flask.flash("Student and Project required.", "warning")
-        return flask.redirect(
-            flask.url_for(
-                "visualization_web.view_solution", solution_id=solution_id
-            )
-        )
+        return flask.redirect(back)
+
+    error = _lock_target_error(student_id, project_id)
+    if error:
+        flask.flash(error, "danger")
+        return flask.redirect(back)
 
     # Persist as fixed assignment
     fixed_repo = repositories.FixedAssignmentRepository()
@@ -893,6 +965,7 @@ def lock_and_rerun(solution_id: str) -> flask.Response:
         flask.url_for("visualization_web.view_run", run_id=new_run.id)
     )
 
+
 @web_bp.post("/clear-solutions")
 def clear_solutions() -> flask.Response:
     """Clears all solutions in the current run."""
@@ -903,6 +976,7 @@ def clear_solutions() -> flask.Response:
 # -----------------------------------------------------------------------------
 # Comparison & Recommendations
 # -----------------------------------------------------------------------------
+
 
 def _run_comparison(
     sol_a_id: str, sol_b_id: str
@@ -1004,6 +1078,7 @@ def compare_solutions() -> Any:
         sol_b=sol_b,
         comparison=comparison,
     )
+
 
 @web_bp.get("/recommendations/<run_id>")
 def view_recommendations(run_id: str) -> Any:
